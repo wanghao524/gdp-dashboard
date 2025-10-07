@@ -1,0 +1,274 @@
+import pandas as pd
+import os
+from datetime import datetime, timedelta
+import streamlit as st
+import io
+
+
+# ========================= 辅助函数 =========================
+def safe_num(x):
+    try:
+        return float(x)
+    except:
+        return 0
+
+
+def find_col(columns, target):
+    # 模糊匹配列名（防止多余空格）
+    for c in columns:
+        if target in c.replace(" ", "").replace("\u3000", "").replace("\xa0", ""):
+            return c
+    raise KeyError(f"❌ 未找到列：{target}")
+
+
+# ========================= 处理函数 =========================
+def process_files(data_file, template_file):
+    """处理上传的文件"""
+    today = datetime.today()
+    today_str = today.strftime("%Y-%m-%d")
+    future_25 = today + timedelta(days=25)
+    future_21 = today + timedelta(days=21)
+
+    try:
+        # 读取数据文件
+        df = pd.read_excel(data_file, sheet_name="例外信息自动计算")
+        df.columns = df.columns.astype(str).str.strip().str.replace('\u3000', '').str.replace('\xa0', '')
+
+        # 显示列名用于调试
+        st.info(f"数据文件列名: {list(df.columns)}")
+
+        # 读取模板文件
+        template = pd.read_excel(template_file)
+
+        # ========== 精确列名匹配 ==========
+        col_pl = find_col(df.columns, "PL")
+        col_item = find_col(df.columns, "ITEM")
+        col_cancel_final = find_col(df.columns, "取消数量-最终")
+        col_delay_final = find_col(df.columns, "推迟数量-最终")
+        col_cpd_day = find_col(df.columns, "cpd天")
+        col_rpd_date = find_col(df.columns, "RPD周最终确认")
+        col_transport = find_col(df.columns, "运输方式")
+
+        st.success("✅ 所有必需的列都已找到")
+
+        # ========== 取消例外 ==========
+        cancel_rows = []
+        for _, row in df.iterrows():
+            cancel_final = safe_num(row[col_cancel_final])
+            if cancel_final != 0:
+                pl = str(row[col_pl])
+                item = row[col_item]
+                batch = pl[-8:] if len(pl) >= 8 else pl
+                contract = pl[:14] if len(pl) >= 14 else pl
+                cancel_rows.append({
+                    "*Site": "SS6",
+                    "*例外数量": cancel_final,
+                    "*Item": item,
+                    "*更新后到货日期": today_str,
+                    "*囤货合同号": contract,
+                    "发货批次": batch,
+                    "发运集": f"{batch}01N",
+                    "*例外类别": "Cancel"
+                })
+
+        # ========== 推迟例外 ==========
+        delay_rows = []
+        manual_rows = []
+
+        for _, row in df.iterrows():
+            delay_final = safe_num(row[col_delay_final])
+            if delay_final == 0:
+                continue
+
+            cpd_day = safe_num(row[col_cpd_day])
+            transport = str(row[col_transport]).strip().lower()
+            rpd_date_raw = row[col_rpd_date]
+
+            try:
+                rpd_date = pd.to_datetime(rpd_date_raw)
+            except:
+                rpd_date = None
+
+            # 判断RPD是否在未来21天内
+            rpd_in_21_days = (rpd_date is not None) and (rpd_date <= future_21)
+
+            # 推迟日期计算
+            if "sea" in transport:
+                new_date = today + timedelta(days=32 + 25)
+            elif "air" in transport:
+                new_date = today + timedelta(days=10 + 25)
+            else:
+                new_date = today + timedelta(days=25)
+            new_date_str = new_date.strftime("%Y-%m-%d")
+
+            pl = str(row[col_pl])
+            item = row[col_item]
+            batch = pl[-8:] if len(pl) >= 8 else pl
+            contract = pl[:14] if len(pl) >= 14 else pl
+
+            row_dict = {
+                "*Site": "SS6",
+                "*例外数量": delay_final,
+                "*Item": item,
+                "*更新后到货日期": new_date_str,
+                "*囤货合同号": contract,
+                "发货批次": batch,
+                "发运集": f"{batch}01N",
+                "*例外类别": "De-Expedite"
+            }
+
+            if cpd_day <= future_25.day and rpd_in_21_days:
+                delay_rows.append(row_dict)
+            elif cpd_day > future_25.day:
+                manual_rows.append(row_dict)
+
+        return cancel_rows, delay_rows, manual_rows, template
+
+    except Exception as e:
+        st.error(f"处理文件时出错: {str(e)}")
+        import traceback
+        st.error(traceback.format_exc())
+        return None, None, None, None
+
+
+def create_download_files(data_rows, name_prefix, template):
+    """创建可下载的文件"""
+    if not data_rows:
+        return []
+
+    files = []
+    chunk_size = 170
+
+    for i in range(0, len(data_rows), chunk_size):
+        part = data_rows[i:i + chunk_size]
+        df_out = pd.DataFrame(part)
+
+        # 确保列顺序与模板一致
+        df_out = df_out.reindex(columns=template.columns, fill_value="")
+
+        # 创建Excel文件在内存中
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df_out.to_excel(writer, index=False)
+        output.seek(0)
+
+        files.append({
+            'data': output,
+            'name': f"{name_prefix}_{i // chunk_size + 1}.xlsx"
+        })
+
+    return files
+
+
+# ========================= Streamlit界面 =========================
+def main():
+    st.set_page_config(
+        page_title="例外处理工具",
+        page_icon="📊",
+        layout="wide"
+    )
+
+    st.title("📊 例外处理工具")
+    st.markdown("""
+    这个工具用于处理例外数据并生成相应的输出文件。
+
+    **使用步骤:**
+    1. 上传数据文件 (包含例外信息自动计算的工作表)
+    2. 上传模板文件
+    3. 点击"处理文件"按钮
+    4. 下载生成的结果文件
+
+    **注意：**
+    - 数据文件必须包含名为"例外信息自动计算"的工作表
+    - 每个输出文件最多170行数据
+    - 如果数据量很大，会自动分割成多个文件
+    """)
+
+    # 文件上传
+    col1, col2 = st.columns(2)
+
+    with col1:
+        data_file = st.file_uploader(
+            "上传数据文件",
+            type=['xlsx'],
+            help="包含'例外信息自动计算'工作表的Excel文件"
+        )
+
+    with col2:
+        template_file = st.file_uploader(
+            "上传模板文件",
+            type=['xlsx'],
+            help="模板Excel文件"
+        )
+
+    # 处理按钮
+    if st.button("🚀 处理文件", type="primary"):
+        if data_file is None or template_file is None:
+            st.error("请先上传两个文件")
+            return
+
+        with st.spinner("正在处理文件..."):
+            cancel_rows, delay_rows, manual_rows, template = process_files(data_file, template_file)
+
+            if cancel_rows is not None:
+                # 显示统计信息
+                st.subheader("📊 处理结果统计")
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("取消例外", len(cancel_rows))
+                with col2:
+                    st.metric("推迟例外", len(delay_rows))
+                with col3:
+                    st.metric("手工例外", len(manual_rows))
+
+                # 生成下载文件
+                st.subheader("📥 下载结果文件")
+
+                # 取消例外文件
+                if cancel_rows:
+                    cancel_files = create_download_files(cancel_rows, "取消例外", template)
+                    st.write("**取消例外文件:**")
+                    for file_info in cancel_files:
+                        st.download_button(
+                            label=f"下载 {file_info['name']}",
+                            data=file_info['data'],
+                            file_name=file_info['name'],
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key=f"cancel_{file_info['name']}"
+                        )
+
+                # 推迟例外文件
+                if delay_rows:
+                    delay_files = create_download_files(delay_rows, "推迟例外", template)
+                    st.write("**推迟例外文件:**")
+                    for file_info in delay_files:
+                        st.download_button(
+                            label=f"下载 {file_info['name']}",
+                            data=file_info['data'],
+                            file_name=file_info['name'],
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key=f"delay_{file_info['name']}"
+                        )
+
+                # 手工例外文件
+                if manual_rows:
+                    manual_files = create_download_files(manual_rows, "手工例外", template)
+                    st.write("**手工例外文件:**")
+                    for file_info in manual_files:
+                        st.download_button(
+                            label=f"下载 {file_info['name']}",
+                            data=file_info['data'],
+                            file_name=file_info['name'],
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key=f"manual_{file_info['name']}"
+                        )
+
+                if not cancel_rows and not delay_rows and not manual_rows:
+                    st.info("没有找到符合条件的例外数据")
+
+                st.success("🎉 文件处理完成！")
+
+
+# ========================= 运行 =========================
+if __name__ == "__main__":
+    main()
